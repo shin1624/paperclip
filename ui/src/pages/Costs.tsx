@@ -34,9 +34,11 @@ import { FinanceBillerCard } from "../components/FinanceBillerCard";
 import { FinanceKindCard } from "../components/FinanceKindCard";
 import { FinanceTimelineCard } from "../components/FinanceTimelineCard";
 import { Identity } from "../components/Identity";
+import { OpusThrottlePanel } from "../components/OpusThrottlePanel";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProviderQuotaCard } from "../components/ProviderQuotaCard";
+import { QuotaIncidentsPanel } from "../components/QuotaIncidentsPanel";
 import { StatusBadge } from "../components/StatusBadge";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
@@ -1270,6 +1272,21 @@ export function Costs() {
             </p>
           ) : (
             <>
+              {/* PMSA-23 / PMSA-11 §4.2: live throttle + incidents panels share
+                  the same envelope as the per-provider quota cards. Throttle
+                  is always rendered when the snapshot resolves so the operator
+                  sees semaphore state alongside Opus saturation; incidents
+                  hide themselves when the watcher window is empty. */}
+              {quotaData?.throttle || quotaData?.incidents ? (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <OpusThrottlePanel
+                    throttle={quotaData?.throttle}
+                    opusSaturation={quotaData?.opusSaturation}
+                  />
+                  <QuotaIncidentsPanel incidents={quotaData?.incidents} />
+                </div>
+              ) : null}
+
               <Tabs value={effectiveProvider} onValueChange={setActiveProvider}>
                 <PageTabBar
                   items={providerTabItems}
