@@ -2483,23 +2483,37 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        // PMSA-22: Optional CAS guard. When set, both the prefetch SELECT and
+        // the row UPDATE require executionRunId to equal this value, so the
+        // call no-ops (returns null) if another operator re-claimed the issue
+        // between read and write.
+        expectedExecutionRunId?: string | null;
       },
       dbOrTx: any = db,
     ) => {
-      const existing = await dbOrTx
-        .select()
-        .from(issues)
-        .where(eq(issues.id, id))
-        .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
-      if (!existing) return null;
-
       const {
         labelIds: nextLabelIds,
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        expectedExecutionRunId,
         ...issueData
       } = data;
+      const idFilter =
+        expectedExecutionRunId !== undefined
+          ? and(
+              eq(issues.id, id),
+              expectedExecutionRunId === null
+                ? isNull(issues.executionRunId)
+                : eq(issues.executionRunId, expectedExecutionRunId),
+            )
+          : eq(issues.id, id);
+      const existing = await dbOrTx
+        .select()
+        .from(issues)
+        .where(idFilter)
+        .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
+      if (!existing) return null;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
@@ -2602,7 +2616,7 @@ export function issueService(db: Db) {
         const updated = await tx
           .update(issues)
           .set(patch)
-          .where(eq(issues.id, id))
+          .where(idFilter)
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;

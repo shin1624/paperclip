@@ -3870,16 +3870,41 @@ export function heartbeatService(
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) return null;
 
+    // PMSA-22: Guard SELECT by executionRunId so we do not act on a row that
+    // has been re-claimed by another run between failure and exhaustion. The
+    // matching UPDATE below uses the same guard for symmetry with the
+    // scheduling tx (heartbeat.ts L4150-4156).
     const issueRow = await db
       .select({
         id: issues.id,
         status: issues.status,
         identifier: issues.identifier,
+        executionRunId: issues.executionRunId,
       })
       .from(issues)
       .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
       .then((rows) => rows[0] ?? null);
     if (!issueRow) return null;
+    if (issueRow.executionRunId !== run.id) {
+      // Another run owns this issue now — skip blocker write entirely.
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `quota_retry_exhausted (${opts.errorCode}); issue ${issueRow.identifier ?? issueId} no longer owned by this run, skipping blocker update`,
+        payload: {
+          quotaRetryExhausted: true,
+          errorCode: opts.errorCode,
+          attempts: opts.attempts,
+          maxAttempts: opts.maxAttempts,
+          issueId,
+          issueStatus: issueRow.status,
+          executionRunIdOnIssue: issueRow.executionRunId,
+          skipped: "execution_run_changed",
+        },
+      });
+      return issueRow;
+    }
     if (issueRow.status === "blocked" || issueRow.status === "cancelled") {
       // Don't overwrite a manual blocker or undo a cancellation.
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -3923,9 +3948,14 @@ export function heartbeatService(
 
     let blockedIssue: Awaited<ReturnType<typeof issuesSvc.update>> = null;
     try {
+      // PMSA-22: CAS-style guard — the UPDATE WHERE clause requires
+      // executionRunId = run.id, so a concurrent reassignment between SELECT
+      // above and this write is a no-op (returns null) instead of a silent
+      // overwrite.
       blockedIssue = await issuesSvc.update(issueId, {
         status: "blocked",
         actorAgentId: agent.id,
+        expectedExecutionRunId: run.id,
       });
     } catch (err) {
       logger.warn(
@@ -3934,18 +3964,39 @@ export function heartbeatService(
       );
     }
 
-    if (blockedIssue) {
-      try {
-        await issuesSvc.addComment(issueId, commentBody, {
+    if (!blockedIssue) {
+      // Either the WHERE guard rejected the update (race lost) or the call
+      // threw. Surface a structured event so observers can distinguish this
+      // from the happy path without misreporting issueStatus as "blocked".
+      await appendRunEvent(run, await nextRunEventSeq(run.id), {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `quota_retry_exhausted (${opts.errorCode}); issue ${issueRow.identifier ?? issueId} blocker write skipped (executionRunId guard)`,
+        payload: {
+          quotaRetryExhausted: true,
+          errorCode: opts.errorCode,
+          attempts: opts.attempts,
+          maxAttempts: opts.maxAttempts,
+          issueId,
+          issueStatus: issueRow.status,
           agentId: agent.id,
-          runId: run.id,
-        });
-      } catch (err) {
-        logger.warn(
-          { err, issueId, runId: run.id },
-          "failed to post quota-exhaustion blocker comment",
-        );
-      }
+          skipped: "execution_run_changed_during_update",
+        },
+      });
+      return issueRow;
+    }
+
+    try {
+      await issuesSvc.addComment(issueId, commentBody, {
+        agentId: agent.id,
+        runId: run.id,
+      });
+    } catch (err) {
+      logger.warn(
+        { err, issueId, runId: run.id },
+        "failed to post quota-exhaustion blocker comment",
+      );
     }
 
     await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -3959,12 +4010,12 @@ export function heartbeatService(
         attempts: opts.attempts,
         maxAttempts: opts.maxAttempts,
         issueId,
-        issueStatus: blockedIssue ? "blocked" : issueRow.status,
+        issueStatus: "blocked",
         agentId: agent.id,
       },
     });
 
-    return blockedIssue ?? issueRow;
+    return blockedIssue;
   }
 
   async function scheduleBoundedRetryForRun(

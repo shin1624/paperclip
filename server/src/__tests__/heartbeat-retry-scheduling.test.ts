@@ -1293,4 +1293,126 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .then((rows) => rows[0]?.count ?? 0);
     expect(commentCount).toBe(0);
   });
+
+  // PMSA-22: If another run re-claims the executing issue between failure and
+  // exhaustion, the executionRunId guard MUST prevent the blocker write so we
+  // do not silently overwrite the new owner's status. The exhausted run still
+  // emits a structured `skipped: execution_run_changed` event for traceability.
+  it("does not overwrite the issue when another run has re-claimed executionRunId", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const otherRunId = randomUUID();
+    const issueId = randomUUID();
+    const now = new Date("2026-04-21T13:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "ClaudeCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_local",
+      adapterConfig: {},
+      runtimeConfig: {
+        heartbeat: {
+          wakeOnDemand: true,
+          maxConcurrentRuns: 1,
+        },
+      },
+      permissions: {},
+    });
+
+    // Issue is in_progress and *appears* live, but executionRunId points at a
+    // different run — i.e. our run lost ownership before exhaustion fired.
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Re-claimed during quota exhaustion",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      executionRunId: otherRunId,
+      executionAgentNameKey: "claudecoder",
+      executionLockedAt: now,
+      issueNumber: 1,
+      identifier: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "failed",
+      error: "Anthropic 401 quota_exhausted",
+      errorCode: "claude_quota_exhausted",
+      finishedAt: now,
+      scheduledRetryAttempt: BOUNDED_TRANSIENT_QUOTA_RETRY_DELAYS_MS.length,
+      scheduledRetryReason: "transient_failure",
+      resultJson: { errorFamily: "transient_upstream" },
+      contextSnapshot: {
+        issueId,
+        wakeReason: "transient_failure_retry",
+      },
+      updatedAt: now,
+      createdAt: now,
+    });
+
+    const exhausted = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+    expect(exhausted.outcome).toBe("retry_exhausted");
+
+    const issueAfter = await db
+      .select({
+        status: issues.status,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // Status MUST remain in_progress and ownership MUST stay with the other run.
+    expect(issueAfter?.status).toBe("in_progress");
+    expect(issueAfter?.executionRunId).toBe(otherRunId);
+
+    const commentCount = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((rows) => rows[0]?.count ?? 0);
+    expect(commentCount).toBe(0);
+
+    const skipEvent = await db
+      .select({
+        message: heartbeatRunEvents.message,
+        payload: heartbeatRunEvents.payload,
+      })
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))
+      .orderBy(sql`${heartbeatRunEvents.id} desc`)
+      .then(
+        (rows) =>
+          rows.find(
+            (row) =>
+              (row.payload as Record<string, unknown> | null)?.skipped ===
+              "execution_run_changed",
+          ) ?? null,
+      );
+    expect(skipEvent).not.toBeNull();
+    expect(skipEvent?.payload).toMatchObject({
+      quotaRetryExhausted: true,
+      issueId,
+      skipped: "execution_run_changed",
+      executionRunIdOnIssue: otherRunId,
+    });
+  });
 });
