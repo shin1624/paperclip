@@ -32,6 +32,7 @@ import {
   feedbackService,
   heartbeatService,
   instanceSettingsService,
+  issueService,
   QUOTA_WATCHER_INTERVAL_MS,
   quotaWatcherService,
   reconcilePersistedRuntimeServicesOnStartup,
@@ -961,7 +962,26 @@ export async function startServer(): Promise<StartedServer> {
     // board sees silent degradation rather than a stalled UI. Runs decoupled
     // from the heartbeat tick to keep its cadence stable even when the
     // heartbeat scheduler interval is shortened during dogfooding.
-    const quotaWatcher = quotaWatcherService(db as any);
+    //
+    // PMSA-21 / PMSA-11 §3.5: the same watcher also consumes the
+    // `quotaRetryExhausted` lifecycle events PMSA-18 stamps on
+    // `heartbeat_run_events`. Wire `issueResume` and `enqueueWakeup` so the
+    // event-driven path can flip blocked→todo + nudge the assignee when the
+    // Opus quota window has rolled back below saturation.
+    const quotaWatcherIssues = issueService(db as any);
+    const quotaWatcher = quotaWatcherService(db as any, {
+      issueResume: async (issueId, args) =>
+        quotaWatcherIssues.update(issueId, {
+          status: args.nextStatus,
+          actorAgentId: args.agentId,
+        }),
+      enqueueWakeup: (agentId, opts) =>
+        heartbeat.wakeup(agentId, {
+          reason: opts.reason,
+          source: opts.source ?? "automation",
+          contextSnapshot: opts.contextSnapshot,
+        }),
+    });
     setInterval(() => {
       void quotaWatcher
         .tickAllCompanies()
@@ -988,6 +1008,48 @@ export async function startServer(): Promise<StartedServer> {
         })
         .catch((err) => {
           logger.error({ err }, "quota watcher tick failed");
+        });
+
+      // PMSA-21 event-driven sweep — runs on the same cadence so resume /
+      // approval actions land within one watcher interval of the
+      // `quotaRetryExhausted` event being emitted by PMSA-18.
+      void quotaWatcher
+        .tickAllCompaniesQuotaEvents()
+        .then((result) => {
+          if (
+            result.resumedIssues > 0 ||
+            result.approvalsCreated > 0 ||
+            result.approvalsDeduped > 0
+          ) {
+            logger.warn(
+              {
+                scanned: result.scanned,
+                resumedIssues: result.resumedIssues,
+                approvalsCreated: result.approvalsCreated,
+                approvalsDeduped: result.approvalsDeduped,
+                companies: result.results
+                  .filter(
+                    (r) =>
+                      r.resumedIssues > 0 ||
+                      r.approvalsCreated > 0 ||
+                      r.approvalsDeduped > 0,
+                  )
+                  .map((r) => ({
+                    companyId: r.companyId,
+                    scannedEvents: r.scannedEvents,
+                    uniquePairs: r.uniquePairs,
+                    resumedIssues: r.resumedIssues,
+                    approvalsCreated: r.approvalsCreated,
+                    approvalsDeduped: r.approvalsDeduped,
+                    quotaRecovered: r.quotaRecovered,
+                  })),
+              },
+              "quota event watcher resumed or paged on quota_retry_exhausted events",
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "quota event watcher tick failed");
         });
     }, QUOTA_WATCHER_INTERVAL_MS);
   }
