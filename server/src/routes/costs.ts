@@ -18,6 +18,9 @@ import {
   logActivity,
   quotaIncidentsService,
   clampQuotaIncidentWindowMinutes,
+  quotaWatcherService,
+  QUOTA_WATCHER_COMPANY_INCIDENT_WINDOW_MINUTES,
+  findOpusWeeklySaturation,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
@@ -62,6 +65,7 @@ export function costRoutes(
   const companies = companyService(db);
   const agents = agentService(db);
   const quotaIncidents = quotaIncidentsService(db);
+  const quotaWatcher = quotaWatcherService(db, { quotaIncidents });
 
   router.post(
     "/companies/:companyId/cost-events",
@@ -233,8 +237,39 @@ export function costRoutes(
       res.status(404).json({ error: "Company not found" });
       return;
     }
-    const results = await fetchAllQuotaWindows();
-    res.json(results);
+    // PMSA-19 / PMSA-11 §4.2: enrich the legacy provider-windows payload with
+    // the incidents + throttle data the quota watcher uses for board
+    // notifications, so the costs dashboard can show the same picture the
+    // approval payload renders. The legacy `windows` array is preserved at
+    // the top level; new fields are additive.
+    const [providers, incidents, throttle] = await Promise.all([
+      fetchAllQuotaWindows(),
+      quotaIncidents.listRecent(companyId, {
+        windowMinutes: QUOTA_WATCHER_COMPANY_INCIDENT_WINDOW_MINUTES,
+      }),
+      quotaWatcher.getThrottleSnapshot(companyId),
+    ]);
+    res.json({
+      windows: providers,
+      incidents: {
+        windowMinutes: incidents.windowMinutes,
+        windowStart: incidents.windowStart.toISOString(),
+        windowEnd: incidents.windowEnd.toISOString(),
+        total: incidents.total,
+        totalByCode: incidents.totalByCode,
+        oldestAt: incidents.oldestAt ? incidents.oldestAt.toISOString() : null,
+        newestAt: incidents.newestAt ? incidents.newestAt.toISOString() : null,
+        byAgent: incidents.byAgent.map((row) => ({
+          agentId: row.agentId,
+          agentName: row.agentName,
+          count: row.count,
+          countByCode: row.countByCode,
+          lastAt: row.lastAt ? row.lastAt.toISOString() : null,
+        })),
+      },
+      throttle,
+      opusSaturation: findOpusWeeklySaturation(providers),
+    });
   });
 
   // PMSA-15 / PMSA-11 §2.2: granular Claude quota incident counts (401/429/5xx) for the

@@ -32,6 +32,8 @@ import {
   feedbackService,
   heartbeatService,
   instanceSettingsService,
+  QUOTA_WATCHER_INTERVAL_MS,
+  quotaWatcherService,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
 } from "./services/index.js";
@@ -953,6 +955,41 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
     }, config.heartbeatSchedulerIntervalMs);
+
+    // PMSA-19 / PMSA-11 §4: independent 5-minute sweep that turns sustained
+    // Opus quota pressure into a `request_board_attention` approval so the
+    // board sees silent degradation rather than a stalled UI. Runs decoupled
+    // from the heartbeat tick to keep its cadence stable even when the
+    // heartbeat scheduler interval is shortened during dogfooding.
+    const quotaWatcher = quotaWatcherService(db as any);
+    setInterval(() => {
+      void quotaWatcher
+        .tickAllCompanies()
+        .then((result) => {
+          if (result.approvalsCreated > 0 || result.triggered > 0) {
+            logger.warn(
+              {
+                scanned: result.scanned,
+                triggered: result.triggered,
+                approvalsCreated: result.approvalsCreated,
+                triggers: result.results
+                  .filter((r) => r.triggers.length > 0)
+                  .map((r) => ({
+                    companyId: r.companyId,
+                    triggers: r.triggers,
+                    approvalId: r.approvalId,
+                    approvalCreated: r.approvalCreated,
+                    skippedReason: r.skippedReason,
+                  })),
+              },
+              "quota watcher tick created or skipped board approval",
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "quota watcher tick failed");
+        });
+    }, QUOTA_WATCHER_INTERVAL_MS);
   }
 
   if (config.databaseBackupEnabled) {

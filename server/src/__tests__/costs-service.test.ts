@@ -3,7 +3,14 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { randomUUID } from "node:crypto";
-import { createDb, companies, agents, costEvents, financeEvents, projects } from "@paperclipai/db";
+import {
+  createDb,
+  companies,
+  agents,
+  costEvents,
+  financeEvents,
+  projects,
+} from "@paperclipai/db";
 import { costService } from "../services/costs.ts";
 import { financeService } from "../services/finance.ts";
 import {
@@ -28,7 +35,9 @@ function makeDb(overrides: Record<string, unknown> = {}) {
   return {
     select: vi.fn().mockReturnValue(thenableChain),
     insert: vi.fn().mockReturnValue({
-      values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
+      values: vi
+        .fn()
+        .mockReturnValue({ returning: vi.fn().mockResolvedValue([]) }),
     }),
     update: vi.fn().mockReturnValue({
       set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }),
@@ -62,7 +71,15 @@ const mockCostService = vi.hoisted(() => ({
 }));
 const mockFinanceService = vi.hoisted(() => ({
   createEvent: vi.fn(),
-  summary: vi.fn().mockResolvedValue({ debitCents: 0, creditCents: 0, netCents: 0, estimatedDebitCents: 0, eventCount: 0 }),
+  summary: vi
+    .fn()
+    .mockResolvedValue({
+      debitCents: 0,
+      creditCents: 0,
+      netCents: 0,
+      estimatedDebitCents: 0,
+      eventCount: 0,
+    }),
   byBiller: vi.fn().mockResolvedValue([]),
   byKind: vi.fn().mockResolvedValue([]),
   list: vi.fn().mockResolvedValue([]),
@@ -89,6 +106,44 @@ function registerModuleMocks() {
     agentService: () => mockAgentService,
     heartbeatService: () => mockHeartbeatService,
     logActivity: mockLogActivity,
+    // PMSA-15: quota incidents service used by /quota-incidents and the
+    // quota-watcher route assembly. Tests in this file exercise budget /
+    // finance routes only, so a no-op stub keeps the costRoutes constructor
+    // alive without forcing every test to seed full quota data.
+    quotaIncidentsService: () => ({
+      listRecent: vi.fn().mockResolvedValue({
+        windowMinutes: 30,
+        windowStart: new Date(0),
+        windowEnd: new Date(0),
+        total: 0,
+        totalByCode: {
+          claude_quota_exhausted: 0,
+          claude_rate_limited: 0,
+          claude_provider_5xx: 0,
+        },
+        oldestAt: null,
+        newestAt: null,
+        byAgent: [],
+      }),
+    }),
+    clampQuotaIncidentWindowMinutes: (value: unknown) =>
+      typeof value === "number" ? value : 30,
+    // PMSA-19: quota-watcher service stub mirroring quotaIncidentsService —
+    // route handlers in this file's tests do not exercise the watcher path,
+    // so a no-op throttle snapshot is enough to satisfy module init.
+    quotaWatcherService: () => ({
+      evaluateCompany: vi.fn(),
+      tickAllCompanies: vi.fn(),
+      getThrottleSnapshot: vi.fn().mockResolvedValue({
+        provider: "anthropic",
+        modelFamily: "opus",
+        capacity: 2,
+        inflight: 0,
+        waiters: 0,
+      }),
+    }),
+    QUOTA_WATCHER_COMPANY_INCIDENT_WINDOW_MINUTES: 30,
+    findOpusWeeklySaturation: () => null,
   }));
 
   vi.doMock("../services/quota-windows.js", () => ({
@@ -99,12 +154,18 @@ function registerModuleMocks() {
 async function createApp() {
   const [{ costRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/costs.js")>("../routes/costs.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    ),
   ]);
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    req.actor = { type: "board", userId: "board-user", source: "local_implicit" };
+    req.actor = {
+      type: "board",
+      userId: "board-user",
+      source: "local_implicit",
+    };
     next();
   });
   app.use("/api", costRoutes(makeDb() as any));
@@ -115,7 +176,9 @@ async function createApp() {
 async function createAppWithActor(actor: any) {
   const [{ costRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/costs.js")>("../routes/costs.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    vi.importActual<typeof import("../middleware/index.js")>(
+      "../middleware/index.js",
+    ),
   ]);
   const app = express();
   app.use(express.json());
@@ -129,7 +192,8 @@ async function createAppWithActor(actor: any) {
 }
 
 async function loadCostParsers() {
-  const { parseCostDateRange, parseCostLimit } = await import("../routes/costs.js");
+  const { parseCostDateRange, parseCostLimit } =
+    await import("../routes/costs.js");
   return { parseCostDateRange, parseCostLimit };
 }
 
@@ -167,10 +231,12 @@ beforeEach(() => {
 describe("cost routes", () => {
   it("accepts valid ISO date strings", async () => {
     const { parseCostDateRange } = await loadCostParsers();
-    expect(parseCostDateRange({
-      from: "2026-01-01T00:00:00.000Z",
-      to: "2026-01-31T23:59:59.999Z",
-    })).toEqual({
+    expect(
+      parseCostDateRange({
+        from: "2026-01-01T00:00:00.000Z",
+        to: "2026-01-31T23:59:59.999Z",
+      }),
+    ).toEqual({
       from: new Date("2026-01-01T00:00:00.000Z"),
       to: new Date("2026-01-31T23:59:59.999Z"),
     });
@@ -178,19 +244,26 @@ describe("cost routes", () => {
 
   it("returns 400 for an invalid 'from' date string", async () => {
     const { parseCostDateRange } = await loadCostParsers();
-    expect(() => parseCostDateRange({ from: "not-a-date" })).toThrow(/invalid 'from' date/i);
+    expect(() => parseCostDateRange({ from: "not-a-date" })).toThrow(
+      /invalid 'from' date/i,
+    );
   });
 
   it("returns 400 for an invalid 'to' date string", async () => {
     const { parseCostDateRange } = await loadCostParsers();
-    expect(() => parseCostDateRange({ to: "banana" })).toThrow(/invalid 'to' date/i);
+    expect(() => parseCostDateRange({ to: "banana" })).toThrow(
+      /invalid 'to' date/i,
+    );
   });
 
   it("returns finance summary rows for valid requests", async () => {
     const app = await createApp();
     const res = await request(app)
       .get("/api/companies/company-1/costs/finance-summary")
-      .query({ from: "2026-02-01T00:00:00.000Z", to: "2026-02-28T23:59:59.999Z" });
+      .query({
+        from: "2026-02-01T00:00:00.000Z",
+        to: "2026-02-28T23:59:59.999Z",
+      });
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       debitCents: 0,
@@ -297,7 +370,9 @@ describe("cost routes", () => {
       source: "session",
       isInstanceAdmin: false,
       companyIds: ["company-1"],
-      memberships: [{ companyId: "company-1", status: "active", membershipRole: "admin" }],
+      memberships: [
+        { companyId: "company-1", status: "active", membershipRole: "admin" },
+      ],
     });
 
     const res = await request(app)
@@ -305,7 +380,9 @@ describe("cost routes", () => {
       .send({ budgetMonthlyCents: 2500 });
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.update).toHaveBeenCalledWith("agent-1", { budgetMonthlyCents: 2500 });
+    expect(mockAgentService.update).toHaveBeenCalledWith("agent-1", {
+      budgetMonthlyCents: 2500,
+    });
     expect(mockBudgetService.upsertPolicy).toHaveBeenCalledWith(
       "company-1",
       {
@@ -333,16 +410,22 @@ describe("cost routes", () => {
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
-const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported
+  ? describe
+  : describe.skip;
 
 describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
   let db!: ReturnType<typeof createDb>;
   let costs!: ReturnType<typeof costService>;
   let finance!: ReturnType<typeof financeService>;
-  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let tempDb: Awaited<
+    ReturnType<typeof startEmbeddedPostgresTestDatabase>
+  > | null = null;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-costs-service-");
+    tempDb = await startEmbeddedPostgresTestDatabase(
+      "paperclip-costs-service-",
+    );
     db = createDb(tempDb.connectionString);
     costs = costService(db);
     finance = financeService(db);

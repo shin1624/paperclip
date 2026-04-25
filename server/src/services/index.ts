@@ -43,6 +43,29 @@ export {
   type QuotaIncidentAgentBreakdown,
   type QuotaIncidentErrorCode,
 } from "./quota-incidents.js";
+export {
+  QUOTA_WATCHER_INTERVAL_MS,
+  QUOTA_WATCHER_COMPANY_INCIDENT_WINDOW_MINUTES,
+  QUOTA_WATCHER_AGENT_STREAK_WINDOW_MINUTES,
+  QUOTA_WATCHER_COMPANY_INCIDENT_THRESHOLD,
+  QUOTA_WATCHER_AGENT_STREAK_THRESHOLD,
+  QUOTA_WATCHER_OPUS_UTILIZATION_THRESHOLD_PERCENT,
+  QUOTA_INCIDENT_APPROVAL_TYPE,
+  QUOTA_INCIDENT_APPROVAL_SUBTYPE,
+  computeQuotaStreaksFromRows,
+  findOpusWeeklySaturation,
+  quotaWatcherService,
+  type QuotaWatcherAgentStreak,
+  type QuotaWatcherDeps,
+  type QuotaWatcherMetricsSnapshot,
+  type QuotaWatcherOpusSaturation,
+  type QuotaWatcherRecommendedAction,
+  type QuotaWatcherService,
+  type QuotaWatcherThrottleSnapshot,
+  type QuotaWatcherTickAllResult,
+  type QuotaWatcherTickResult,
+  type QuotaWatcherTriggerReason,
+} from "./quota-watcher.js";
 export { financeService } from "./finance.js";
 export { heartbeatService } from "./heartbeat.js";
 export {
